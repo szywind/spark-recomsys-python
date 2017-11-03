@@ -5,19 +5,20 @@ from pyspark import SparkContext, SparkConf
 import numpy as np
 from numpy.linalg import norm
 
-from pyspark.mllib.recommendation import ALS, MatrixFactorizationModel, Rating,
+from pyspark.mllib.recommendation import ALS, MatrixFactorizationModel, Rating
 
 os.environ['PYSPARK_PYTHON'] = sys.executable
 
-local_test = False
+local_test = True
 
 if local_test:
-    HDFS_ROOT = "hdfs://localhost:9000/clothes/" # set by conf of hadoop
-    SPARK_MASTER_ADDR = "spark://YZM-2.local:7077"
+    HDFS_ROOT = "hdfs://localhost:9000/demo/" # set by conf of hadoop
+    SPARK_MASTER_ADDR = "local[2]"
+    # SPARK_MASTER_ADDR = "spark://YZM-2.local:7077" # read spark ui:8080 or check SPARK_MASTER_HOST in the file $SPARK_HOME/sbin/start-master.sh
     EVENT_LOG_DIR = "/Users/a/PycharmProjects/spark-recomsys/logs"
 else:
     HDFS_ROOT = "hdfs://yzm2:9000/demo/"
-    SPARK_MASTER = "spark://localhost:7077"
+    SPARK_MASTER_ADDR = "spark://localhost:7077"
     EVENT_LOG_DIR = "/home/yzm/logs"
 
 
@@ -32,32 +33,40 @@ conf = (SparkConf().set("spark.master", SPARK_MASTER_ADDR)
         .setAppName("Clothes Recommend System"))
 sc = SparkContext(conf=conf)
 
-class Item:
-    def __init__(self, cid, attr = None, prefer = None):
-        self.uid = int(cid[cid.find('_')+1:cid.rfind('.')])
-        self.attr = attr
-        self.prefer = prefer
+# class Item:
+#     def __init__(self, cid, attr = None, pref = None):
+#         self.cid = int(cid[cid.find('_')+1:cid.rfind('.')])
+#         self.attr = attr
+#         self.pref = pref
+#
+#     def attribute_similarity(self, that):
+#         return np.dot(self.attr, that.attr)/(norm(self.attr)*norm(that.attr))
+#
+#     def preference_similarity(self, that):
+#         return np.dot(self.pref, that.pref)/(norm(self.pref)*norm(that.pref))
+#
+#
+# class User:
+#     def __init__(self, uid, attr = None, pref = None):
+#         self.uid = int(uid[:uid.rfind('.')])
+#         self.attr = attr
+#         self.pref = pref
+#
+#     def attribute_similarity(self, that):
+#         return np.dot(self.attr, that.attr)/(norm(self.attr)*norm(that.attr))
+#
+#     def preference_similarity(self, that):
+#         return np.dot(self.pref, that.pref)/(norm(self.pref)*norm(that.pref))
 
-    def attribute_similarity(self, that):
-        return np.dot(self.attr, that.feature)/(norm(self.attr)*norm(that.feature))
 
-    def preference_similarity(self, that):
-        return np.dot(self.prefer, that.prefer)/(norm(self.prefer)*norm(that.prefer))
+def extract_user_id(uid):
+    return int(uid[:uid.rfind('.')])
 
+def extract_item_id(cid):
+    return int(cid[cid.find('_') + 1:cid.rfind('.')])
 
-class User:
-    def __init__(self, uid, attr = None, prefer = None):
-        self.uid = int(uid[:uid.rfind('.')])
-        self.attr = attr
-        self.prefer = prefer
-
-    def attribute_similarity(self, that):
-        return np.dot(self.attr, that.feature)/(norm(self.attr)*norm(that.feature))
-
-    def preference_similarity(self, that):
-        return np.dot(self.prefer, that.prefer)/(norm(self.prefer)*norm(that.prefer))
-
-
+def cosin_similarity(u, v):
+    return (np.inner(u, v)/(norm(u)*norm(v)) + 1) / 2.0
 
 class ClothesRecommend:
     def __init__(self):
@@ -66,14 +75,23 @@ class ClothesRecommend:
         user_data = sc.textFile(HDFS_ROOT + 'input/user-features.csv')
 
         self.ratings = rating_data.map(lambda l: l.split(',')).map(lambda l: Rating(int(l[0]), int(l[1]), float(l[2])))
-        self.items = item_data.map(lambda l: l.split(',')).map(lambda l: Item(l[0], attr=l[1:]))
-        self.users = user_data.map(lambda l: l.split(',')).map(lambda l: User(l[-1], attr=l[:-1]))
+        self.items = item_data.map(lambda l: l.split(',')).map(lambda l: (extract_item_id(l[0]), list(map(float, l[1:]))))
+        self.users = user_data.map(lambda l: l.split(',')).map(lambda l: (extract_user_id(l[-1]), list(map(float, l[:-1]))))
 
-        rating_dict = {}
-        for r in self.ratings.collect():
-            if not r.user in rating_dict:
-                rating_dict[r.user] = {}
-            rating_dict[r.user][r.product] = r.rating
+        self.num_users = self.users.count()
+        self.num_items = self.items.count()
+
+        # get {user: {item: rating}}
+        self.user_rating_dict = dict(self.ratings.map(lambda l: (int(l[0]), (int(l[1]), float(l[2])))).groupByKey().mapValues(dict).collect())
+        # get {item: {user: rating}}
+        self.item_rating_dict = dict(self.ratings.map(lambda l: (int(l[1]), (int(l[0]), float(l[2])))).groupByKey().mapValues(dict).collect())
+
+        # https://stackoverflow.com/questions/40087483/spark-average-of-values-instead-of-sum-in-reducebykey-using-scala
+        # compute average rating of each item
+        self.item_avg_rating = self.ratings.map(lambda l: (int(l[1]), (float(l[2]), 1))).\
+            reduceByKey(lambda x,y: (x[0]+y[0], x[1]+y[1])).mapValues(lambda x: 1.0 * x[0] / x[1]).collectAsMap()
+
+        self.model = None
 
     def trainModelCF(self):
 
@@ -84,56 +102,109 @@ class ClothesRecommend:
         # Build the recommendation model using Alternating Least Squares
         rank = 10
         numIterations = 10
-        model = ALS.train(self.ratings, rank, numIterations)
+        self.model = ALS.train(self.ratings, rank, numIterations)
 
         # Evaluate the model on training data
         testdata = self.ratings.map(lambda p: (p[0], p[1]))
-        predictions = model.predictAll(testdata).map(lambda r: ((r[0], r[1]), r[2]))
+        predictions = self.model.predictAll(testdata).map(lambda r: ((r[0], r[1]), r[2]))
         ratesAndPreds = self.ratings.map(lambda r: ((r[0], r[1]), r[2])).join(predictions)
         MSE = ratesAndPreds.map(lambda r: (r[1][0] - r[1][1]) ** 2).mean()
         print("Mean Squared Error = " + str(MSE))
 
         # Save and load model
         model_path = HDFS_ROOT + 'models/modelCF'
-        model.save(sc, model_path)
+        self.model.save(sc, model_path)
         sameModel = MatrixFactorizationModel.load(sc, model_path)
 
-    def trainItemCF(self):
-
-        user_list = self.users.collect()
-        rating_dict = A
-        for user in user_list:
-            user.prefer = get_preference(user, A)
-
-        pass
-
-    def trainUserCF(self):
-        pass
+    def predModelCF(self, uid, cid):
+        if self.model is None:
+            try:
+                model_path = HDFS_ROOT + 'models/modelCF'
+                self.model = MatrixFactorizationModel.load(sc, model_path)
+            except:
+                raise RuntimeError("No model found!")
+        rating = self.model.predict(uid, cid)
+        return rating
 
 
-    def trainUserSimilarity(self):
+    def predUserCF(self, uid, cid):
+        rating = 0
+        denominator = 0.0
+        if uid in self.user_rating_dict:
+            if cid in self.user_rating_dict[uid]:
+                return self.user_rating_dict[uid][cid]
+        for u in self.user_rating_dict:
+            if u == uid:
+                continue
+            try:
+                rating += self.user_rating_dict[u][cid] * self.user_similarity[(uid, u)]
+                denominator += self.user_similarity[(uid, u)]
+            except:
+                pass
+        if denominator == 0:
+            try:
+                rating = self.item_avg_rating[cid]
+            except:
+                pass
+        else:
+            rating /= denominator
+        return rating
+
+    def predItemCF(self, uid, cid):
+        rating = 0
+        denominator = 0.0
+        if uid in self.user_rating_dict:
+            if cid in self.user_rating_dict[uid]:
+                return self.user_rating_dict[uid][cid]
+            for c in self.user_rating_dict[uid]:
+                try:
+                    rating += self.user_rating_dict[uid][c] * self.item_similarity[(cid, c)]
+                    denominator += self.item_similarity[(cid, c)]
+                except:
+                    pass
+        if denominator == 0:
+            try:
+                rating = self.item_avg_rating[cid]
+            except:
+                pass
+        else:
+            rating /= denominator
+        return rating
+
+
+    def compUserSimilarity(self):
 
         # compute similarity b/w users
         user_list = self.users.collect()
-        num_user = self.users.count()
         self.user_similarity = {}
-        for i in range(num_user):
-            for j in range(i, num_user):
+        for i in range(self.num_users):
+            for j in range(i, self.num_users):
                 u = user_list[i]
                 v = user_list[j]
-                self.user_similarity[(u.uid, v.uid)] = self.user_similarity[(v.uid, u.uid)] = u.attribute_similarity(v)
+                self.user_similarity[(u[0], v[0])] = self.user_similarity[(v[0], u[0])] = cosin_similarity(u[1], v[1])
 
-    def trainItemSimiarity(self):
+    def compItemSimiarity(self):
 
         # compute similarity b/w items
         item_list = self.items.collect()
-        num_item = self.items.count()
         self.item_similarity = {}
-        for i in range(num_item):
-            for j in range(i, num_item):
+        for i in range(self.num_items):
+            for j in range(i, self.num_items):
                 u = item_list[i]
                 v = item_list[j]
-                self.item_similarity[(u.uid, v.uid)] = self.item_similarity[(v.uid, u.uid)] = u.attribute_similarity(v)
+                self.item_similarity[(u[0], v[0])] = self.item_similarity[(v[0], u[0])] = cosin_similarity(u[1], v[1])
+
+
+
+if __name__ == "__main__":
+    rcm = ClothesRecommend()
+    rcm.compItemSimiarity()
+    rcm.compUserSimilarity()
+    rcm.trainModelCF()
+
+    rcm.predUserCF(12, 3)
+    rcm.predItemCF(12, 16)
+    rcm.predModelCF(12,16)
 
 
 
@@ -144,9 +215,7 @@ class ClothesRecommend:
 
 
 
-
-
-
+'''
 import os, sys, random
 import pandas as pd
 from pyspark import mllib
@@ -154,7 +223,7 @@ from pyspark import SparkContext, SparkConf
 from pyspark.mllib.recommendation import ALS, MatrixFactorizationModel, Rating
 
 
-conf = (SparkConf().set("spark.master", "spark://localhost:7077")  # read spark ui:8080 or check SPARK_MASTER_HOST in the file $SPARK_HOME/sbin/start-master.sh
+conf = (SparkConf().set("spark.master", "spark://localhost:7077")  
         .set("spark.eventLog.enabled)",True)
         .set("spark.task.cpus",1)
         .set("spark.driver.memory","1g")
@@ -188,3 +257,5 @@ model_path = HDFS_ROOT + 'models/modelCF'
 
 model.save(sc, model_path)
 sameModel = MatrixFactorizationModel.load(sc, model_path)
+
+'''
